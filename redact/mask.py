@@ -1,12 +1,12 @@
-"""Contract stubs for a small, offline log-redaction engine.
+"""A small, offline log-redaction engine.
 
 The module is deliberately dependency-free: only :mod:`re` and
-:mod:`hashlib` from the standard library may be used by the implementation.
-The eight public functions below currently raise
-:class:`NotImplementedError`; their docstrings are the authoritative
-contract.  All matching, replacement, validation, and comparison tolerance
-is zero.  There is no randomness: the same input, rules, and salt must always
-produce the same output.
+:mod:`hashlib` from the standard library are used by the implementation.
+The eight public functions below implement the contracts in their
+docstrings, which are the authoritative specification.  All matching,
+replacement, validation, and comparison tolerance is zero.  There is no
+randomness: the same input, rules, and salt must always produce the same
+output.
 
 Security invariants that apply across the module:
 
@@ -75,6 +75,89 @@ SENSITIVE_KEY_KINDS = {
     "card_no": "bankcard",
 }
 
+# ---------------------------------------------------------------------------
+# Detector patterns (defect 1: boundary-aware phone; defect 2: idcard allows X)
+# ---------------------------------------------------------------------------
+
+#: Characters allowed inside a prefixed credential payload.
+_TOKEN_CHARS = r"A-Za-z0-9_-"
+
+#: Mainland mobile number: 1[3-9] plus nine digits, with no adjacent ASCII
+#: letter or digit on either side, so a digit substring of a longer order
+#: number can never match.
+_PHONE_RE = re.compile(r"(?<![A-Za-z0-9])1[3-9]\d{9}(?![A-Za-z0-9])")
+
+#: 18-character mainland identity number.  The check character may be a digit
+#: or ``X``/``x``; year/month/day have a plausible shape (no checksum).
+_IDCARD_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"\d{6}"
+    r"(?:18|19|20)\d{2}"
+    r"(?:0[1-9]|1[0-2])"
+    r"(?:0[1-9]|[12]\d|3[01])"
+    r"\d{3}[\dXx]"
+    r"(?![A-Za-z0-9])"
+)
+
+#: Standalone run of 13-19 digits that is not part of a longer digit run.
+_BANKCARD_RE = re.compile(r"(?<!\d)\d{13,19}(?!\d)")
+
+#: E-mail address with a non-empty local part and a dotted, alphabetic TLD.
+#: A trailing sentence period is surrounding punctuation and stays outside
+#: the match, while another dot-label (``.cn``) means the address continues.
+_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+\-])"
+    r"[A-Za-z0-9._%+\-]+@"
+    r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"
+    r"(?![A-Za-z0-9\-])(?![.][A-Za-z]{2,})"
+)
+
+#: Prefixed credentials.  Prefix and payload are both part of the match.
+_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:sk-[" + _TOKEN_CHARS + r"]{8,}"
+    r"|gh[pousr]_[" + _TOKEN_CHARS + r"]{20,}"
+    r"|xox[baprs]-[" + _TOKEN_CHARS + r"]{10,})"
+)
+
+#: Precedence, highest first: idcard > email > token > bankcard > phone.
+_DETECTORS = (
+    ("idcard", _IDCARD_RE),
+    ("email", _EMAIL_RE),
+    ("token", _TOKEN_RE),
+    ("bankcard", _BANKCARD_RE),
+    ("phone", _PHONE_RE),
+)
+
+# ---------------------------------------------------------------------------
+# unmaskable patterns (defect 9)
+# ---------------------------------------------------------------------------
+
+#: 17-digit identity-number prefix, plausible region/date/sequence but no
+#: final digit or X, and not adjacent to further digits or X/x.
+_IDCARD_PREFIX_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"\d{6}"
+    r"(?:18|19|20)\d{2}"
+    r"(?:0[1-9]|1[0-2])"
+    r"(?:0[1-9]|[12]\d|3[01])"
+    r"\d{3}"
+    r"(?![0-9Xx])"
+)
+
+#: Local part plus ``@`` with no valid dotted domain following it.
+_BROKEN_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+\-])"
+    r"[A-Za-z0-9._%+\-]+@"
+    r"(?![A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})"
+)
+
+#: ``sk-`` with zero through seven payload characters (a valid token needs
+#: at least eight), so the next character must not be a token character.
+_BROKEN_SK_RE = re.compile(
+    r"(?<![A-Za-z0-9])sk-[" + _TOKEN_CHARS + r"]{0,7}(?![A-Za-z0-9_-])"
+)
+
 
 def detect(text: str) -> list[dict]:
     """Find sensitive items in *text* and return their exact source ranges.
@@ -132,7 +215,32 @@ def detect(text: str) -> list[dict]:
     Matching is deterministic and tolerance is zero: there are no fuzzy
     matches, normalisation passes, or locale-dependent rules.
     """
-    raise NotImplementedError("detect is not implemented")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+
+    candidates = []
+    for rank, (kind, pattern) in enumerate(_DETECTORS):
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            candidates.append((rank, start, end, kind, match.group()))
+
+    # Highest precedence first; within a precedence, the longer span wins;
+    # earliest start is the final tie-breaker for deterministic output.
+    candidates.sort(key=lambda item: (item[0], -(item[2] - item[1]), item[1]))
+
+    accepted_spans: list[tuple[int, int]] = []
+    results = []
+    for _rank, start, end, kind, value in candidates:
+        if any(start < taken_end and end > taken_start
+               for taken_start, taken_end in accepted_spans):
+            continue
+        accepted_spans.append((start, end))
+        results.append(
+            {"kind": kind, "value": value, "start": start, "end": end}
+        )
+
+    results.sort(key=lambda item: item["start"])
+    return results
 
 
 def mask_value(kind: str, value: str, keep: int) -> str:
@@ -159,7 +267,24 @@ def mask_value(kind: str, value: str, keep: int) -> str:
     new string, must not contain any original character from the masked
     middle, and must be deterministic (tolerance 0).
     """
-    raise NotImplementedError("mask_value is not implemented")
+    if not isinstance(kind, str) or not kind:
+        raise ValueError("kind must be a non-empty string")
+    if not isinstance(value, str):
+        raise TypeError("value must be a string")
+    # ``bool`` is an ``int`` subclass but is never a valid keep value.
+    if isinstance(keep, bool) or not isinstance(keep, int):
+        raise ValueError("keep must be a non-negative integer")
+    if keep < 0:
+        raise ValueError("keep must be a non-negative integer")
+
+    length = len(value)
+    if length == 0:
+        return ""
+    # keep == 0 reveals nothing; when both retained ends would meet or
+    # overlap, mask the whole value instead of returning it unchanged.
+    if keep == 0 or 2 * keep >= length:
+        return "*" * length
+    return value[:keep] + "*" * (length - 2 * keep) + value[length - keep:]
 
 
 def hash_value(value: str, salt: str) -> str:
@@ -180,7 +305,135 @@ def hash_value(value: str, salt: str) -> str:
     forbidden.  The output is new, deterministic, and compared exactly
     (tolerance 0).
     """
-    raise NotImplementedError("hash_value is not implemented")
+    if not isinstance(salt, str):
+        raise TypeError("salt must be a string")
+    if salt == "":
+        raise ValueError("salt must be a non-empty string")
+    if not isinstance(value, str):
+        raise TypeError("value must be a string")
+    digest = hashlib.sha256(
+        salt.encode("utf-8") + b"\x00" + value.encode("utf-8")
+    )
+    return digest.hexdigest()
+
+
+def validate_rules(rules: list[dict]) -> list[str]:
+    """Audit a rule list and return human-readable problems; empty means valid.
+
+    This function never raises for malformed *rules*; every problem is
+    reported as a string.  It checks, in stable order:
+
+    * *rules* is a list and each entry is a mapping;
+    * ``kind`` is a non-empty string and is one of :data:`KINDS`
+      case-insensitively; an unsupported kind has no detector or sensitive
+      key mapping and is therefore an **empty match** that could never fire;
+    * no ``kind`` occurs twice -- a duplicate is an **overlap** and the later
+      rule is reported;
+    * ``action`` is ``"mask"`` or ``"hash"``;
+    * a mask rule has a non-negative integer ``keep`` (booleans are not
+      integers here) and ``keep <= MAX_KEEP``; anything above the maximum is
+      reported as an excessive keep value;
+    * a hash rule has a non-empty string ``salt``; missing, empty, and
+      non-string salts are reported;
+    * no rule mutates its input.
+
+    Messages are ASCII and stable, for example
+    ``"rule[1]: overlapping rule for kind 'phone'"``,
+    ``"rule[2]: empty match for unsupported kind 'mystery'"``,
+    ``"rule[3]: keep 99 exceeds maximum 6"``, and
+    ``"rule[4]: hash rule requires a non-empty salt"``.  A clean rule list
+    returns ``[]``.  Validation is deterministic with tolerance zero; it is
+    an audit helper, not a substitute for enforcement in :func:`redact`.
+    """
+    if not isinstance(rules, list):
+        return ["rules must be a list of rule mappings"]
+
+    problems: list[str] = []
+    seen_kinds: set[str] = set()
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            problems.append(f"rule[{index}]: rule must be a mapping")
+            continue
+
+        kind = rule.get("kind")
+        if not isinstance(kind, str) or not kind.strip():
+            problems.append(
+                f"rule[{index}]: kind must be a non-empty string"
+            )
+            continue
+
+        normalised_kind = kind.lower()
+        if normalised_kind not in KINDS:
+            problems.append(
+                f"rule[{index}]: empty match for unsupported kind '{kind}'"
+            )
+        if normalised_kind in seen_kinds:
+            problems.append(
+                f"rule[{index}]: overlapping rule for kind "
+                f"'{normalised_kind}'"
+            )
+        else:
+            seen_kinds.add(normalised_kind)
+
+        action = rule.get("action", "mask")
+        if action not in ("mask", "hash"):
+            problems.append(f"rule[{index}]: unsupported action '{action}'")
+            continue
+
+        if action == "mask":
+            keep = rule.get("keep")
+            if isinstance(keep, bool) or not isinstance(keep, int) \
+                    or keep < 0:
+                problems.append(
+                    f"rule[{index}]: mask rule requires a non-negative "
+                    f"integer keep"
+                )
+            elif keep > MAX_KEEP:
+                problems.append(
+                    f"rule[{index}]: keep {keep} exceeds maximum {MAX_KEEP}"
+                )
+        else:
+            salt = rule.get("salt")
+            if not isinstance(salt, str) or not salt:
+                problems.append(
+                    f"rule[{index}]: hash rule requires a non-empty salt"
+                )
+
+    return problems
+
+
+def _rule_map(rules: list[dict]) -> dict:
+    """Index validated rules by lower-cased kind."""
+    return {rule["kind"].lower(): rule for rule in rules}
+
+
+def _apply_rule(kind: str, value: str, rules_by_kind: dict) -> str:
+    """Replace one detected span; fail closed when no rule exists."""
+    rule = rules_by_kind.get(kind)
+    if rule is None:
+        # No rule for this kind: never leave the secret in the clear.
+        return "*" * len(value)
+    if rule.get("action", "mask") == "hash":
+        return hash_value(value, rule["salt"])
+    return mask_value(kind, value, rule["keep"])
+
+
+def _redact_string(text: str, rules_by_kind: dict) -> str:
+    """Redact from spans detected on the original text in one pass."""
+    spans = detect(text)
+    if not spans:
+        return text
+
+    parts = []
+    cursor = 0
+    for span in spans:
+        start, end = span["start"], span["end"]
+        parts.append(text[cursor:start])
+        parts.append(_apply_rule(span["kind"], text[start:end],
+                                 rules_by_kind))
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
 
 
 def redact(text: str, rules: list[dict]) -> str:
@@ -212,7 +465,20 @@ def redact(text: str, rules: list[dict]) -> str:
     structure raises ``ValueError``; use :func:`validate_rules` for a
     non-raising audit.  Replacement tolerance is zero.
     """
-    raise NotImplementedError("redact is not implemented")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    problems = validate_rules(rules)
+    if problems:
+        raise ValueError("invalid rules: " + "; ".join(problems))
+    return _redact_string(text, _rule_map(rules))
+
+
+def _normalised_key_kind(key) -> str | None:
+    """Return the forced kind for a JSON key after normalisation, if any."""
+    if not isinstance(key, str):
+        return None
+    normalised = key.strip().lower().replace("-", "_")
+    return SENSITIVE_KEY_KINDS.get(normalised)
 
 
 def redact_json(obj, rules: list[dict]) -> dict:
@@ -251,7 +517,33 @@ def redact_json(obj, rules: list[dict]) -> dict:
     that value or of any sibling.  Output is deterministic and tolerance is
     zero.
     """
-    raise NotImplementedError("redact_json is not implemented")
+    problems = validate_rules(rules)
+    if problems:
+        raise ValueError("invalid rules: " + "; ".join(problems))
+    rules_by_kind = _rule_map(rules)
+
+    def walk(node, forced_kind: str | None):
+        if isinstance(node, dict):
+            return {
+                key: walk(value, _normalised_key_kind(key))
+                for key, value in node.items()
+            }
+        if isinstance(node, list):
+            return [walk(item, forced_kind) for item in node]
+        if isinstance(node, tuple):
+            return tuple(walk(item, forced_kind) for item in node)
+        if isinstance(node, str):
+            if forced_kind is not None:
+                # Sensitive key context: redact the value as a whole.
+                return _apply_rule(forced_kind, node, rules_by_kind)
+            return _redact_string(node, rules_by_kind)
+        # Non-string scalar.  Under a sensitive key it is stringified and
+        # redacted; otherwise it passes through untouched.
+        if forced_kind is not None:
+            return _apply_rule(forced_kind, str(node), rules_by_kind)
+        return node
+
+    return walk(obj, None)
 
 
 def unmaskable(text: str) -> list[str]:
@@ -277,38 +569,24 @@ def unmaskable(text: str) -> list[str]:
     not modify *text* and does not throw on malformed input; an empty string
     returns ``[]``.
     """
-    raise NotImplementedError("unmaskable is not implemented")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
 
+    matches = []
+    for pattern in (_IDCARD_PREFIX_RE, _BROKEN_EMAIL_RE, _BROKEN_SK_RE):
+        for match in pattern.finditer(text):
+            matches.append((match.start(), match.group()))
 
-def validate_rules(rules: list[dict]) -> list[str]:
-    """Audit a rule list and return human-readable problems; empty means valid.
+    matches.sort(key=lambda item: item[0])
 
-    This function never raises for malformed *rules*; every problem is
-    reported as a string.  It checks, in stable order:
-
-    * *rules* is a list and each entry is a mapping;
-    * ``kind`` is a non-empty string and is one of :data:`KINDS`
-      case-insensitively; an unsupported kind has no detector or sensitive
-      key mapping and is therefore an **empty match** that could never fire;
-    * no ``kind`` occurs twice -- a duplicate is an **overlap** and the later
-      rule is reported;
-    * ``action`` is ``"mask"`` or ``"hash"``;
-    * a mask rule has a non-negative integer ``keep`` (booleans are not
-      integers here) and ``keep <= MAX_KEEP``; anything above the maximum is
-      reported as an excessive keep value;
-    * a hash rule has a non-empty string ``salt``; missing, empty, and
-      non-string salts are reported;
-    * no rule mutates its input.
-
-    Messages are ASCII and stable, for example
-    ``"rule[1]: overlapping rule for kind 'phone'"``,
-    ``"rule[2]: empty match for unsupported kind 'mystery'"``,
-    ``"rule[3]: keep 99 exceeds maximum 6"``, and
-    ``"rule[4]: hash rule requires a non-empty salt"``.  A clean rule list
-    returns ``[]``.  Validation is deterministic with tolerance zero; it is
-    an audit helper, not a substitute for enforcement in :func:`redact`.
-    """
-    raise NotImplementedError("validate_rules is not implemented")
+    fragments = []
+    seen_values = set()
+    for _start, fragment in matches:
+        if fragment in seen_values:
+            continue
+        seen_values.add(fragment)
+        fragments.append(fragment)
+    return fragments
 
 
 def redact_batch(lines, rules: list[dict]) -> dict:
@@ -332,4 +610,23 @@ def redact_batch(lines, rules: list[dict]) -> dict:
     iterable and *rules* must not be mutated.  The function never concatenates
     lines and never inserts separators.  Comparisons are exact (tolerance 0).
     """
-    raise NotImplementedError("redact_batch is not implemented")
+    # A string is iterable, but a batch must be a collection of lines.
+    if isinstance(lines, str):
+        raise TypeError("lines must be an iterable of strings, not a string")
+
+    problems = validate_rules(rules)
+    if problems:
+        raise ValueError("invalid rules: " + "; ".join(problems))
+    rules_by_kind = _rule_map(rules)
+
+    redacted_lines = []
+    changed = False
+    for line in lines:
+        # Each call gets fresh locals and fresh detection; nothing carries
+        # over from the previous line.
+        redacted = _redact_string(line, rules_by_kind)
+        if redacted != line:
+            changed = True
+        redacted_lines.append(redacted)
+
+    return {"lines": redacted_lines, "changed": changed}
